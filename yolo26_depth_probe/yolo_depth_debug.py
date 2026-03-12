@@ -75,7 +75,7 @@ class YoloGpuTrackerNode(Node):
         # classes=[39]는 'bottle' 등 특정 클래스이므로, 테스트 시에는 빼거나 물체를 꼭 두세요. 
         results = self.model.predict(
             source=frame_rgb, imgsz=self.imgsz, conf=0.25,
-            classes=[39], verbose=False, device=self.device, half=True
+            verbose=False, device=self.device, half=True
         )
         r = results[0]
 
