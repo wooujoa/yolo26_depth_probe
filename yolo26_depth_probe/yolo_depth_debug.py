@@ -21,7 +21,7 @@ class YoloGpuTrackerNode(Node):
 
         # 2. Topics (설정하신 토픽명 유지) 
         self.color_topic = "/camera_r/camera_r/color/image_rect_raw/compressed"
-        self.depth_topic = "/camera_r/camera_r/depth/image_rect_raw"
+        self.depth_topic = "/camera_r/camera_r/aligned_depth_to_color/image_raw"
         self.info_topic = "/camera_r/camera_r/depth/camera_info"
         self.target_3d_topic = "/yolo/target_3d_pose"
 
