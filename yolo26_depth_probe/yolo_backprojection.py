@@ -229,11 +229,11 @@ class YoloPointCloudNode(Node):
         self.overlay_topic = "/yolo/overlay/image"
         self.pc_topic = "/yolo/target_pc" 
         """
-        
+
         # ---- FFW Topics(left기준) ----
-        self.color_topic = "/camera_l/camera_l/color/image_rect_raw"
-        self.depth_topic = "/camera_l/camera_l/depth/image_rect_raw"
-        self.info_topic = "/camera_l/camera_l/color/camera_info" # YOLO(Color) 기준이므로 color의 info를 사용합니다.
+        self.color_topic = "/camera_l/camera_l/color/image_rect_raw/compressed"
+        self.depth_topic = "/camera_l/camera_l/aligned_depth_to_color/image_raw"
+        self.info_topic = "/camera_l/camera_l/aligned_depth_to_color/camera_info" # YOLO(Color) 기준이므로 color의 info를 사용합니다.
         self.overlay_topic = "/yolo/overlay/image"
         self.pc_topic = "/yolo/target_pc"
         
