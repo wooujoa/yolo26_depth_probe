@@ -20,9 +20,9 @@ class YoloGpuTrackerNode(Node):
         self.get_logger().info(f"🚀 YOLO started on: {self.device}")
 
         # 2. Topics (설정하신 토픽명 유지) 
-        self.color_topic = "/camera_r/camera_r/color/image_rect_raw/compressed"
-        self.depth_topic = "/camera_r/camera_r/aligned_depth_to_color/image_raw"
-        self.info_topic = "/camera_r/camera_r/depth/camera_info"
+        self.color_topic = "/camera_l/camera_l/color/image_rect_raw/compressed"
+        self.depth_topic = "/camera_l/camera_l/aligned_depth_to_color/image_raw"
+        self.info_topic = "/camera_l/camera_l/aligned_depth_to_color/camera_info"
         self.target_3d_topic = "/yolo/target_3d_pose"
 
         # 3. Subscriptions (QoS 10)
