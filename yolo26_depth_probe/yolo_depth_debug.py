@@ -3,6 +3,7 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image, CameraInfo, CompressedImage
 from geometry_msgs.msg import PointStamped
+from std_msgs.msg import Float32MultiArray
 from cv_bridge import CvBridge
 import numpy as np
 import cv2
@@ -25,7 +26,10 @@ class YoloGpuTrackerNode(Node):
         self.color_topic = "/camera_l/camera_l/color/image_rect_raw/compressed"
         self.depth_topic = "/camera_l/camera_l/aligned_depth_to_color/image_raw"
         self.info_topic = "/camera_l/camera_l/aligned_depth_to_color/camera_info"
+
         self.target_3d_topic = "/yolo/target_3d_pose"
+        self.bbox_center_topic = "/yolo/bbox_center_px"
+        self.bbox_size_topic = "/yolo/bbox_size_px"
 
         # 3. Subscriptions
         self.sub_color = self.create_subscription(
@@ -38,8 +42,10 @@ class YoloGpuTrackerNode(Node):
             CameraInfo, self.info_topic, self.info_cb, qos_profile_sensor_data
         )
 
-        # 4. Publisher
+        # 4. Publishers
         self.pub_3d = self.create_publisher(PointStamped, self.target_3d_topic, 10)
+        self.pub_bbox_center = self.create_publisher(PointStamped, self.bbox_center_topic, 10)
+        self.pub_bbox_size = self.create_publisher(Float32MultiArray, self.bbox_size_topic, 10)
 
         self.bridge = CvBridge()
         self.latest_depth_msg = None
@@ -48,13 +54,25 @@ class YoloGpuTrackerNode(Node):
         self.frame_count = 0
 
         # ===== Z filtering buffer =====
-        self.z_history = deque(maxlen=7)   # 최근 7프레임 저장
-        self.min_history_size = 3          # 최소 3개 이상 쌓여야 publish
-        self.outlier_thresh_m = 0.10       # median 기준 10cm 이상 차이나면 outlier 제거
+        self.z_history = deque(maxlen=7)
+        self.min_history_size = 3
+        self.outlier_thresh_m = 0.10
+
+        self.get_logger().info("========================================")
+        self.get_logger().info(f"color_topic       : {self.color_topic}")
+        self.get_logger().info(f"depth_topic       : {self.depth_topic}")
+        self.get_logger().info(f"info_topic        : {self.info_topic}")
+        self.get_logger().info(f"target_3d_topic   : {self.target_3d_topic}")
+        self.get_logger().info(f"bbox_center_topic : {self.bbox_center_topic}")
+        self.get_logger().info(f"bbox_size_topic   : {self.bbox_size_topic}")
+        self.get_logger().info("========================================")
 
     def info_cb(self, msg: CameraInfo):
         if self.camera_intrinsics is None:
-            self.get_logger().info("✅ Camera Info Received")
+            self.get_logger().info(
+                f"✅ Camera Info Received | frame_id={msg.header.frame_id} "
+                f"K=[fx={msg.k[0]:.3f}, fy={msg.k[4]:.3f}, cx={msg.k[2]:.3f}, cy={msg.k[5]:.3f}]"
+            )
             self.camera_intrinsics = msg
 
     def depth_cb(self, msg: Image):
@@ -73,10 +91,8 @@ class YoloGpuTrackerNode(Node):
                 self.get_logger().warn("⚠️ Waiting for Depth Image...")
             return
 
-        # optional: color/depth timestamp 차이 체크
         self._log_time_diff_if_needed(msg, self.latest_depth_msg)
 
-        # 이미지 디코딩
         try:
             np_arr = np.frombuffer(msg.data, np.uint8)
             decoded = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
@@ -88,7 +104,6 @@ class YoloGpuTrackerNode(Node):
             self.get_logger().error(f"❌ Decoding Error: {e}")
             return
 
-        # YOLO 추론
         results = self.model.predict(
             source=frame_rgb,
             imgsz=self.imgsz,
@@ -99,76 +114,111 @@ class YoloGpuTrackerNode(Node):
         )
         r = results[0]
 
-        if r.boxes is not None and len(r.boxes) > 0:
-            self.get_logger().info(f"🎯 Detected: {len(r.boxes)} objects")
-
-            try:
-                boxes = r.boxes.xyxy.cpu().numpy()
-                cv_depth = self.bridge.imgmsg_to_cv2(
-                    self.latest_depth_msg, desired_encoding="passthrough"
-                )
-
-                fx = float(self.camera_intrinsics.k[0])
-                fy = float(self.camera_intrinsics.k[4])
-                cx = float(self.camera_intrinsics.k[2])
-                cy = float(self.camera_intrinsics.k[5])
-
-                for box in boxes:
-                    u = int((box[0] + box[2]) / 2)
-                    v = int((box[1] + box[3]) / 2)
-
-                    depth_m = self._get_median_depth(
-                        cv_depth,
-                        self.latest_depth_msg.encoding,
-                        u,
-                        v
-                    )
-
-                    if depth_m is not None:
-                        # raw depth를 history에 저장
-                        self.z_history.append(depth_m)
-
-                        # 충분한 히스토리가 쌓였을 때만 publish
-                        if len(self.z_history) < self.min_history_size:
-                            self.get_logger().info(
-                                f"⏳ Collecting depth history... "
-                                f"{len(self.z_history)}/{self.min_history_size} "
-                                f"(raw_z={depth_m:.3f}m)"
-                            )
-                            continue
-
-                        z_filtered = self._get_filtered_depth()
-
-                        if z_filtered is None:
-                            self.get_logger().warn(
-                                f"❓ Could not compute filtered depth at ({u}, {v})"
-                            )
-                            continue
-
-                        out_pt = PointStamped()
-                        out_pt.header = self.latest_depth_msg.header
-                        out_pt.point.x = (u - cx) * z_filtered / fx
-                        out_pt.point.y = (v - cy) * z_filtered / fy
-                        out_pt.point.z = float(z_filtered)
-
-                        self.pub_3d.publish(out_pt)
-
-                        self.get_logger().info(
-                            f"📤 Published 3D Pose | "
-                            f"pixel=({u},{v}) "
-                            f"raw_z={depth_m:.3f}m "
-                            f"filtered_z={z_filtered:.3f}m "
-                            f"history={list(np.round(np.array(self.z_history), 3))}"
-                        )
-                    else:
-                        self.get_logger().warn(f"❓ Invalid Depth at center ({u}, {v})")
-
-            except Exception as e:
-                self.get_logger().error(f"❌ Processing Error: {e}")
-
-        else:
+        if r.boxes is None or len(r.boxes) == 0:
             if self.frame_count % 30 == 0:
                 self.get_logger().info("🔍 Searching for target...")
+            return
+
+        try:
+            boxes = r.boxes.xyxy.cpu().numpy()
+            confs = r.boxes.conf.cpu().numpy() if r.boxes.conf is not None else None
+            clss = r.boxes.cls.cpu().numpy() if r.boxes.cls is not None else None
+
+            cv_depth = self.bridge.imgmsg_to_cv2(
+                self.latest_depth_msg, desired_encoding="passthrough"
+            )
+
+            fx = float(self.camera_intrinsics.k[0])
+            fy = float(self.camera_intrinsics.k[4])
+            cx = float(self.camera_intrinsics.k[2])
+            cy = float(self.camera_intrinsics.k[5])
+
+            self.get_logger().info(f"🎯 Detected: {len(boxes)} objects")
+
+            for i, box in enumerate(boxes):
+                x1, y1, x2, y2 = map(float, box)
+                width = x2 - x1
+                height = y2 - y1
+                u = int((x1 + x2) / 2.0)
+                v = int((y1 + y2) / 2.0)
+
+                conf_str = ""
+                if confs is not None:
+                    conf_str = f", conf={float(confs[i]):.3f}"
+                cls_str = ""
+                if clss is not None:
+                    cls_str = f", cls={int(clss[i])}"
+
+                # 1) bbox center pixel publish
+                bbox_center_msg = PointStamped()
+                bbox_center_msg.header = self.latest_depth_msg.header
+                bbox_center_msg.point.x = float(u)
+                bbox_center_msg.point.y = float(v)
+                bbox_center_msg.point.z = 0.0
+                self.pub_bbox_center.publish(bbox_center_msg)
+
+                # 2) bbox size publish
+                bbox_size_msg = Float32MultiArray()
+                bbox_size_msg.data = [float(width), float(height)]
+                self.pub_bbox_size.publish(bbox_size_msg)
+
+                # 3) depth -> 3D
+                depth_m = self._get_median_depth(
+                    cv_depth,
+                    self.latest_depth_msg.encoding,
+                    u,
+                    v
+                )
+
+                if depth_m is None:
+                    self.get_logger().warn(
+                        f"❓ Invalid Depth | center_px=({u},{v}), "
+                        f"bbox_size=({width:.1f}, {height:.1f})"
+                        f"{cls_str}{conf_str}"
+                    )
+                    continue
+
+                self.z_history.append(depth_m)
+
+                if len(self.z_history) < self.min_history_size:
+                    self.get_logger().info(
+                        f"⏳ Collecting depth history... "
+                        f"{len(self.z_history)}/{self.min_history_size} | "
+                        f"center_px=({u},{v}), bbox_size=({width:.1f}, {height:.1f}), "
+                        f"raw_z={depth_m:.3f}m"
+                        f"{cls_str}{conf_str}"
+                    )
+                    continue
+
+                z_filtered = self._get_filtered_depth()
+                if z_filtered is None:
+                    self.get_logger().warn(
+                        f"❓ Could not compute filtered depth at ({u}, {v})"
+                    )
+                    continue
+
+                x_m = (u - cx) * z_filtered / fx
+                y_m = (v - cy) * z_filtered / fy
+
+                out_pt = PointStamped()
+                out_pt.header = self.latest_depth_msg.header
+                out_pt.point.x = float(x_m)
+                out_pt.point.y = float(y_m)
+                out_pt.point.z = float(z_filtered)
+                self.pub_3d.publish(out_pt)
+
+                self.get_logger().info(
+                    f"📤 YOLO Output | "
+                    f"bbox_size=({width:.1f}, {height:.1f}) px | "
+                    f"center_px=({u}, {v}) | "
+                    f"xyz=({x_m:.3f}, {y_m:.3f}, {z_filtered:.3f}) m | "
+                    f"raw_z={depth_m:.3f}m | "
+                    f"history={list(np.round(np.array(self.z_history), 3))}"
+                    f"{cls_str}{conf_str}"
+                )
+
+        except Exception as e:
+            self.get_logger().error(f"❌ Processing Error: {e}")
 
     def _get_median_depth(self, cv_depth, encoding, u, v):
         r = 2
@@ -206,14 +256,11 @@ class YoloGpuTrackerNode(Node):
 
             vals = np.array(self.z_history, dtype=np.float32)
             med = np.median(vals)
-
-            # median 기준 outlier 제거
             inliers = vals[np.abs(vals - med) <= self.outlier_thresh_m]
 
             if inliers.size == 0:
                 return float(med)
 
-            # 마지막 대표값도 median으로
             return float(np.median(inliers))
 
         except Exception as e:
