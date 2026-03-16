@@ -31,8 +31,20 @@ class YoloGpuTrackerNode(Node):
         self.bbox_center_topic = "/yolo/bbox_center_px"
         self.bbox_size_topic = "/yolo/bbox_size_px"
         self.bbox_size_m_topic = "/yolo/bbox_size_m"
+        self.debug_image_topic = "/yolo/debug_image/compressed"
 
-        # 3. Subscriptions
+        # 3. Parameters
+        self.declare_parameter("debug_image_enable", True)
+        self.declare_parameter("debug_publish_period_sec", 3.0)
+        self.declare_parameter("debug_jpeg_quality", 40)
+        self.declare_parameter("log_every_detection", True)
+
+        self.debug_image_enable = bool(self.get_parameter("debug_image_enable").value)
+        self.debug_publish_period_sec = float(self.get_parameter("debug_publish_period_sec").value)
+        self.debug_jpeg_quality = int(self.get_parameter("debug_jpeg_quality").value)
+        self.log_every_detection = bool(self.get_parameter("log_every_detection").value)
+
+        # 4. Subscriptions
         self.sub_color = self.create_subscription(
             CompressedImage, self.color_topic, self.color_cb, qos_profile_sensor_data
         )
@@ -43,11 +55,12 @@ class YoloGpuTrackerNode(Node):
             CameraInfo, self.info_topic, self.info_cb, qos_profile_sensor_data
         )
 
-        # 4. Publishers
+        # 5. Publishers
         self.pub_3d = self.create_publisher(PointStamped, self.target_3d_topic, 10)
         self.pub_bbox_center = self.create_publisher(PointStamped, self.bbox_center_topic, 10)
         self.pub_bbox_size = self.create_publisher(Float32MultiArray, self.bbox_size_topic, 10)
         self.pub_bbox_size_m = self.create_publisher(Float32MultiArray, self.bbox_size_m_topic, 10)
+        self.pub_debug_img = self.create_publisher(CompressedImage, self.debug_image_topic, 3)
 
         self.bridge = CvBridge()
         self.latest_depth_msg = None
@@ -60,14 +73,21 @@ class YoloGpuTrackerNode(Node):
         self.min_history_size = 3
         self.outlier_thresh_m = 0.10
 
+        # ===== debug image timing =====
+        self.last_debug_pub_time = None
+
         self.get_logger().info("========================================")
-        self.get_logger().info(f"color_topic        : {self.color_topic}")
-        self.get_logger().info(f"depth_topic        : {self.depth_topic}")
-        self.get_logger().info(f"info_topic         : {self.info_topic}")
-        self.get_logger().info(f"target_3d_topic    : {self.target_3d_topic}")
-        self.get_logger().info(f"bbox_center_topic  : {self.bbox_center_topic}")
-        self.get_logger().info(f"bbox_size_topic    : {self.bbox_size_topic}")
-        self.get_logger().info(f"bbox_size_m_topic  : {self.bbox_size_m_topic}")
+        self.get_logger().info(f"color_topic             : {self.color_topic}")
+        self.get_logger().info(f"depth_topic             : {self.depth_topic}")
+        self.get_logger().info(f"info_topic              : {self.info_topic}")
+        self.get_logger().info(f"target_3d_topic         : {self.target_3d_topic}")
+        self.get_logger().info(f"bbox_center_topic       : {self.bbox_center_topic}")
+        self.get_logger().info(f"bbox_size_topic         : {self.bbox_size_topic}")
+        self.get_logger().info(f"bbox_size_m_topic       : {self.bbox_size_m_topic}")
+        self.get_logger().info(f"debug_image_topic       : {self.debug_image_topic}")
+        self.get_logger().info(f"debug_image_enable      : {self.debug_image_enable}")
+        self.get_logger().info(f"debug_publish_period_sec: {self.debug_publish_period_sec}")
+        self.get_logger().info(f"debug_jpeg_quality      : {self.debug_jpeg_quality}")
         self.get_logger().info("========================================")
 
     def info_cb(self, msg: CameraInfo):
@@ -102,11 +122,13 @@ class YoloGpuTrackerNode(Node):
             if decoded is None:
                 self.get_logger().error("❌ Decoding Error: imdecode returned None")
                 return
-            frame_rgb = cv2.cvtColor(decoded, cv2.COLOR_BGR2RGB)
+            frame_bgr = decoded
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         except Exception as e:
             self.get_logger().error(f"❌ Decoding Error: {e}")
             return
 
+        # YOLO 추론
         results = self.model.predict(
             source=frame_rgb,
             imgsz=self.imgsz,
@@ -120,6 +142,14 @@ class YoloGpuTrackerNode(Node):
         if r.boxes is None or len(r.boxes) == 0:
             if self.frame_count % 30 == 0:
                 self.get_logger().info("🔍 Searching for target...")
+            # 검출이 없어도 너무 자주 안 보내게 조건부 debug pub 가능
+            if self.debug_image_enable and self._should_publish_debug():
+                overlay = frame_bgr.copy()
+                cv2.putText(
+                    overlay, "NO DETECTION", (20, 35),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2
+                )
+                self._publish_debug_compressed(overlay, msg.header)
             return
 
         try:
@@ -138,6 +168,20 @@ class YoloGpuTrackerNode(Node):
 
             self.get_logger().info(f"🎯 Detected: {len(boxes)} objects")
 
+            overlay = frame_bgr.copy()
+            draw_overlay = self.debug_image_enable and self._should_publish_debug()
+
+            if draw_overlay:
+                cv2.putText(
+                    overlay,
+                    f"Detections: {len(boxes)}",
+                    (15, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 255, 0),
+                    2
+                )
+
             for i, box in enumerate(boxes):
                 x1, y1, x2, y2 = map(float, box)
                 width_px = x2 - x1
@@ -145,12 +189,8 @@ class YoloGpuTrackerNode(Node):
                 u = int((x1 + x2) / 2.0)
                 v = int((y1 + y2) / 2.0)
 
-                conf_str = ""
-                if confs is not None:
-                    conf_str = f", conf={float(confs[i]):.3f}"
-                cls_str = ""
-                if clss is not None:
-                    cls_str = f", cls={int(clss[i])}"
+                cls_id = int(clss[i]) if clss is not None else -1
+                conf_val = float(confs[i]) if confs is not None else -1.0
 
                 # 1) bbox center pixel publish
                 bbox_center_msg = PointStamped()
@@ -175,29 +215,39 @@ class YoloGpuTrackerNode(Node):
 
                 if depth_m is None:
                     self.get_logger().warn(
-                        f"❓ Invalid Depth | center_px=({u},{v}), "
-                        f"bbox_size_px=({width_px:.1f}, {height_px:.1f})"
-                        f"{cls_str}{conf_str}"
+                        f"det_id={cls_id:02d} conf={conf_val:.2f} "
+                        f"center_px=({u},{v}) bbox_px=({width_px:.1f},{height_px:.1f}) "
+                        f"depth=INVALID"
                     )
+                    if draw_overlay:
+                        self._draw_detection(
+                            overlay, x1, y1, x2, y2, u, v,
+                            cls_id=cls_id, conf_val=conf_val,
+                            extra_text="depth=None"
+                        )
                     continue
 
                 self.z_history.append(depth_m)
 
                 if len(self.z_history) < self.min_history_size:
                     self.get_logger().info(
-                        f"⏳ Collecting depth history... "
-                        f"{len(self.z_history)}/{self.min_history_size} | "
-                        f"center_px=({u},{v}), "
-                        f"bbox_size_px=({width_px:.1f}, {height_px:.1f}), "
-                        f"raw_z={depth_m:.3f}m"
-                        f"{cls_str}{conf_str}"
+                        f"det_id={cls_id:02d} conf={conf_val:.2f} "
+                        f"center_px=({u},{v}) bbox_px=({width_px:.1f},{height_px:.1f}) "
+                        f"raw_z={depth_m:.3f}m collecting={len(self.z_history)}/{self.min_history_size}"
                     )
+                    if draw_overlay:
+                        self._draw_detection(
+                            overlay, x1, y1, x2, y2, u, v,
+                            cls_id=cls_id, conf_val=conf_val,
+                            extra_text=f"z={depth_m:.2f}"
+                        )
                     continue
 
                 z_filtered = self._get_filtered_depth()
                 if z_filtered is None:
                     self.get_logger().warn(
-                        f"❓ Could not compute filtered depth at ({u}, {v})"
+                        f"det_id={cls_id:02d} conf={conf_val:.2f} "
+                        f"center_px=({u},{v}) filtered_depth=FAILED"
                     )
                     continue
 
@@ -220,19 +270,81 @@ class YoloGpuTrackerNode(Node):
                 bbox_size_m_msg.data = [real_width_m, real_height_m]
                 self.pub_bbox_size_m.publish(bbox_size_m_msg)
 
-                self.get_logger().info(
-                    f"📤 YOLO Output | "
-                    f"bbox_size_px=({width_px:.1f}, {height_px:.1f}) px | "
-                    f"bbox_size_m≈({real_width_m:.4f}, {real_height_m:.4f}) m | "
-                    f"center_px=({u}, {v}) | "
-                    f"xyz=({x_m:.3f}, {y_m:.3f}, {z_filtered:.3f}) m | "
-                    f"raw_z={depth_m:.3f}m | "
-                    f"history={list(np.round(np.array(self.z_history), 3))}"
-                    f"{cls_str}{conf_str}"
-                )
+                if self.log_every_detection:
+                    self.get_logger().info(
+                        f"det_id={cls_id:02d} conf={conf_val:.2f} "
+                        f"center_px=({u},{v}) "
+                        f"xyz=({x_m:.3f},{y_m:.3f},{z_filtered:.3f})m "
+                        f"bbox_px=({width_px:.1f},{height_px:.1f}) "
+                        f"bbox_m≈({real_width_m:.3f},{real_height_m:.3f})"
+                    )
+
+                if draw_overlay:
+                    self._draw_detection(
+                        overlay, x1, y1, x2, y2, u, v,
+                        cls_id=cls_id, conf_val=conf_val,
+                        extra_text=f"z={z_filtered:.2f}m"
+                    )
+
+            if draw_overlay:
+                self._publish_debug_compressed(overlay, msg.header)
 
         except Exception as e:
             self.get_logger().error(f"❌ Processing Error: {e}")
+
+    def _draw_detection(self, img, x1, y1, x2, y2, u, v, cls_id=-1, conf_val=-1.0, extra_text=""):
+        x1i, y1i, x2i, y2i = int(x1), int(y1), int(x2), int(y2)
+
+        # bbox
+        cv2.rectangle(img, (x1i, y1i), (x2i, y2i), (0, 255, 0), 2)
+
+        # center
+        cv2.circle(img, (u, v), 4, (0, 0, 255), -1)
+
+        label = f"ID:{cls_id}"
+        if conf_val >= 0.0:
+            label += f" C:{conf_val:.2f}"
+        if extra_text:
+            label += f" {extra_text}"
+
+        text_y = max(20, y1i - 8)
+        cv2.putText(
+            img,
+            label,
+            (x1i, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 255, 0),
+            2
+        )
+
+    def _should_publish_debug(self):
+        now_sec = self.get_clock().now().nanoseconds * 1e-9
+        if self.last_debug_pub_time is None:
+            self.last_debug_pub_time = now_sec
+            return True
+
+        if (now_sec - self.last_debug_pub_time) >= self.debug_publish_period_sec:
+            self.last_debug_pub_time = now_sec
+            return True
+
+        return False
+
+    def _publish_debug_compressed(self, bgr_img, header):
+        try:
+            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), int(self.debug_jpeg_quality)]
+            ok, enc = cv2.imencode(".jpg", bgr_img, encode_param)
+            if not ok:
+                self.get_logger().warn("⚠️ Debug image JPEG encode failed")
+                return
+
+            msg = CompressedImage()
+            msg.header = header
+            msg.format = "jpeg"
+            msg.data = enc.tobytes()
+            self.pub_debug_img.publish(msg)
+        except Exception as e:
+            self.get_logger().error(f"❌ Debug image publish failed: {e}")
 
     def _get_median_depth(self, cv_depth, encoding, u, v):
         r = 2
