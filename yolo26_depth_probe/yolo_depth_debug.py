@@ -30,6 +30,7 @@ class YoloGpuTrackerNode(Node):
         self.target_3d_topic = "/yolo/target_3d_pose"
         self.bbox_center_topic = "/yolo/bbox_center_px"
         self.bbox_size_topic = "/yolo/bbox_size_px"
+        self.bbox_size_m_topic = "/yolo/bbox_size_m"
 
         # 3. Subscriptions
         self.sub_color = self.create_subscription(
@@ -46,6 +47,7 @@ class YoloGpuTrackerNode(Node):
         self.pub_3d = self.create_publisher(PointStamped, self.target_3d_topic, 10)
         self.pub_bbox_center = self.create_publisher(PointStamped, self.bbox_center_topic, 10)
         self.pub_bbox_size = self.create_publisher(Float32MultiArray, self.bbox_size_topic, 10)
+        self.pub_bbox_size_m = self.create_publisher(Float32MultiArray, self.bbox_size_m_topic, 10)
 
         self.bridge = CvBridge()
         self.latest_depth_msg = None
@@ -59,12 +61,13 @@ class YoloGpuTrackerNode(Node):
         self.outlier_thresh_m = 0.10
 
         self.get_logger().info("========================================")
-        self.get_logger().info(f"color_topic       : {self.color_topic}")
-        self.get_logger().info(f"depth_topic       : {self.depth_topic}")
-        self.get_logger().info(f"info_topic        : {self.info_topic}")
-        self.get_logger().info(f"target_3d_topic   : {self.target_3d_topic}")
-        self.get_logger().info(f"bbox_center_topic : {self.bbox_center_topic}")
-        self.get_logger().info(f"bbox_size_topic   : {self.bbox_size_topic}")
+        self.get_logger().info(f"color_topic        : {self.color_topic}")
+        self.get_logger().info(f"depth_topic        : {self.depth_topic}")
+        self.get_logger().info(f"info_topic         : {self.info_topic}")
+        self.get_logger().info(f"target_3d_topic    : {self.target_3d_topic}")
+        self.get_logger().info(f"bbox_center_topic  : {self.bbox_center_topic}")
+        self.get_logger().info(f"bbox_size_topic    : {self.bbox_size_topic}")
+        self.get_logger().info(f"bbox_size_m_topic  : {self.bbox_size_m_topic}")
         self.get_logger().info("========================================")
 
     def info_cb(self, msg: CameraInfo):
@@ -137,8 +140,8 @@ class YoloGpuTrackerNode(Node):
 
             for i, box in enumerate(boxes):
                 x1, y1, x2, y2 = map(float, box)
-                width = x2 - x1
-                height = y2 - y1
+                width_px = x2 - x1
+                height_px = y2 - y1
                 u = int((x1 + x2) / 2.0)
                 v = int((y1 + y2) / 2.0)
 
@@ -157,9 +160,9 @@ class YoloGpuTrackerNode(Node):
                 bbox_center_msg.point.z = 0.0
                 self.pub_bbox_center.publish(bbox_center_msg)
 
-                # 2) bbox size publish
+                # 2) bbox size(px) publish
                 bbox_size_msg = Float32MultiArray()
-                bbox_size_msg.data = [float(width), float(height)]
+                bbox_size_msg.data = [float(width_px), float(height_px)]
                 self.pub_bbox_size.publish(bbox_size_msg)
 
                 # 3) depth -> 3D
@@ -173,7 +176,7 @@ class YoloGpuTrackerNode(Node):
                 if depth_m is None:
                     self.get_logger().warn(
                         f"❓ Invalid Depth | center_px=({u},{v}), "
-                        f"bbox_size=({width:.1f}, {height:.1f})"
+                        f"bbox_size_px=({width_px:.1f}, {height_px:.1f})"
                         f"{cls_str}{conf_str}"
                     )
                     continue
@@ -184,7 +187,8 @@ class YoloGpuTrackerNode(Node):
                     self.get_logger().info(
                         f"⏳ Collecting depth history... "
                         f"{len(self.z_history)}/{self.min_history_size} | "
-                        f"center_px=({u},{v}), bbox_size=({width:.1f}, {height:.1f}), "
+                        f"center_px=({u},{v}), "
+                        f"bbox_size_px=({width_px:.1f}, {height_px:.1f}), "
                         f"raw_z={depth_m:.3f}m"
                         f"{cls_str}{conf_str}"
                     )
@@ -197,6 +201,7 @@ class YoloGpuTrackerNode(Node):
                     )
                     continue
 
+                # 4) 중심 3D 좌표 계산
                 x_m = (u - cx) * z_filtered / fx
                 y_m = (v - cy) * z_filtered / fy
 
@@ -207,9 +212,18 @@ class YoloGpuTrackerNode(Node):
                 out_pt.point.z = float(z_filtered)
                 self.pub_3d.publish(out_pt)
 
+                # 5) bbox 실제 크기 근사값(m) 계산
+                real_width_m = float(width_px * z_filtered / fx)
+                real_height_m = float(height_px * z_filtered / fy)
+
+                bbox_size_m_msg = Float32MultiArray()
+                bbox_size_m_msg.data = [real_width_m, real_height_m]
+                self.pub_bbox_size_m.publish(bbox_size_m_msg)
+
                 self.get_logger().info(
                     f"📤 YOLO Output | "
-                    f"bbox_size=({width:.1f}, {height:.1f}) px | "
+                    f"bbox_size_px=({width_px:.1f}, {height_px:.1f}) px | "
+                    f"bbox_size_m≈({real_width_m:.4f}, {real_height_m:.4f}) m | "
                     f"center_px=({u}, {v}) | "
                     f"xyz=({x_m:.3f}, {y_m:.3f}, {z_filtered:.3f}) m | "
                     f"raw_z={depth_m:.3f}m | "
