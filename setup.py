@@ -28,6 +28,7 @@ setup(
         'depth_probe_node = yolo26_depth_probe.depth_probe_node:main',
         'yolo_bp = yolo26_depth_probe.yolo_backprojection:main',
         'yolo_depth_debug = yolo26_depth_probe.yolo_depth_debug:main',
+        'yolo_depth_debug_r = yolo26_depth_probe.yolo_depth_debug_r:main',
         ],
     },
 )
