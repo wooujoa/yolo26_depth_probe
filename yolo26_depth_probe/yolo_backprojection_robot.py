@@ -31,9 +31,9 @@ class YoloBackprojectionNode(Node):
         # 네 기존 코드 기준으로 /camera/camera/... 로 맞춤
         self.declare_parameter("use_compressed_color", False)
 
-        self.declare_parameter("color_topic", "/camera/camera/color/image_rect_raw")
-        self.declare_parameter("depth_topic", "/camera/camera/aligned_depth_to_color/image_raw")
-        self.declare_parameter("info_topic", "/camera/camera/aligned_depth_to_color/camera_info")
+        self.declare_parameter("color_topic", "/camera_l/camera_l/color/image_rect_raw/compressed")
+        self.declare_parameter("depth_topic", "/camera_l/camera_l/aligned_depth_to_color/image_raw")
+        self.declare_parameter("info_topic", "/camera_l/camera_l/aligned_depth_to_color/camera_info")
 
         self.declare_parameter("overlay_topic", "/yolo/overlay/image/compressed")
 
