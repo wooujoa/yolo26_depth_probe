@@ -18,26 +18,24 @@ class FullFramePointCloudNode(Node):
         # =========================
         # Parameters
         # =========================
-        self.declare_parameter("use_compressed_color", False)
-
-        self.declare_parameter("color_topic", "/camera/camera/color/image_rect_raw")
-        self.declare_parameter("depth_topic", "/camera/camera/aligned_depth_to_color/image_raw")
-        self.declare_parameter("info_topic", "/camera/camera/aligned_depth_to_color/camera_info")
+        self.declare_parameter("use_compressed_color", True)
+        self.declare_parameter("color_topic", "/camera_l/camera_l/color/image_rect_raw/compressed")
+        self.declare_parameter("depth_topic", "/camera_l/camera_l/aligned_depth_to_color/image_raw")
+        self.declare_parameter("info_topic", "/camera_l/camera_l/aligned_depth_to_color/camera_info")
 
         self.declare_parameter("overlay_topic", "/yolo/overlay/image/compressed")
-        self.declare_parameter("pc_topic", "/yolo/target_pc")   # 기존 grasp 노드와 동일
+        self.declare_parameter("pc_topic", "/yolo/target_pc")
 
         self.declare_parameter("pc_publish_period_sec", 0.5)
         self.declare_parameter("debug_publish_period_sec", 2.0)
         self.declare_parameter("debug_jpeg_quality", 40)
 
         # full-frame filtering
-        self.declare_parameter("pixel_stride", 4)          # 1이면 전 픽셀, 2~6 정도 추천
-        self.declare_parameter("min_depth_m", 0.20)
-        self.declare_parameter("max_depth_m", 0.35)
+        self.declare_parameter("min_depth_m", 0.15)
+        self.declare_parameter("max_depth_m", 1.50)
+        self.declare_parameter("pixel_stride", 3)
 
         self.use_compressed_color = bool(self.get_parameter("use_compressed_color").value)
-
         self.color_topic = str(self.get_parameter("color_topic").value)
         self.depth_topic = str(self.get_parameter("depth_topic").value)
         self.info_topic = str(self.get_parameter("info_topic").value)

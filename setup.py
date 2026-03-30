@@ -31,6 +31,7 @@ setup(
         'yolo_depth_debug_r = yolo26_depth_probe.yolo_depth_debug_r:main',
         'yolo_backprojection_local = yolo26_depth_probe.yolo_backprojection_local:main',
         'yolo_backprojection_robot = yolo26_depth_probe.yolo_backprojection_robot:main',
+        'yolo_backprojection_robot_r = yolo26_depth_probe.yolo_backprojection_robot_r:main',
         'fullpc_backprojection = yolo26_depth_probe.fullpc_backprojection:main',
         ],
     },

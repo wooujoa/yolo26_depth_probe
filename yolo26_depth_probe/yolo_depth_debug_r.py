@@ -17,12 +17,10 @@ class YoloGpuTrackerNode(Node):
     def __init__(self):
         super().__init__("yolo_gpu_tracker_node_right")
 
-        # 1. GPU 및 모델 설정
         self.device = 0 if torch.cuda.is_available() else 'cpu'
         self.model = YOLO("yolo26n-seg.pt").to(self.device)
         self.get_logger().info(f"🚀 YOLO started on: {self.device}")
 
-        # 2. Topics (RIGHT ARM CAMERA)
         self.color_topic = "/camera_r/camera_r/color/image_rect_raw/compressed"
         self.depth_topic = "/camera_r/camera_r/aligned_depth_to_color/image_raw"
         self.info_topic = "/camera_r/camera_r/aligned_depth_to_color/camera_info"
@@ -33,18 +31,24 @@ class YoloGpuTrackerNode(Node):
         self.bbox_size_m_topic = "/yolo/bbox_size_m_r"
         self.debug_image_topic = "/yolo/debug_image_r/compressed"
 
-        # 3. Parameters
         self.declare_parameter("debug_image_enable", True)
         self.declare_parameter("debug_publish_period_sec", 3.0)
         self.declare_parameter("debug_jpeg_quality", 40)
         self.declare_parameter("log_every_detection", True)
+
+        self.declare_parameter("skip_if_time_diff_too_large", True)
+        self.declare_parameter("max_color_depth_dt_ms", 120.0)
+        self.declare_parameter("warn_if_time_diff_ms", 100.0)
 
         self.debug_image_enable = bool(self.get_parameter("debug_image_enable").value)
         self.debug_publish_period_sec = float(self.get_parameter("debug_publish_period_sec").value)
         self.debug_jpeg_quality = int(self.get_parameter("debug_jpeg_quality").value)
         self.log_every_detection = bool(self.get_parameter("log_every_detection").value)
 
-        # 4. Subscriptions
+        self.skip_if_time_diff_too_large = bool(self.get_parameter("skip_if_time_diff_too_large").value)
+        self.max_color_depth_dt_ms = float(self.get_parameter("max_color_depth_dt_ms").value)
+        self.warn_if_time_diff_ms = float(self.get_parameter("warn_if_time_diff_ms").value)
+
         self.sub_color = self.create_subscription(
             CompressedImage, self.color_topic, self.color_cb, qos_profile_sensor_data
         )
@@ -55,7 +59,6 @@ class YoloGpuTrackerNode(Node):
             CameraInfo, self.info_topic, self.info_cb, qos_profile_sensor_data
         )
 
-        # 5. Publishers
         self.pub_3d = self.create_publisher(PointStamped, self.target_3d_topic, 10)
         self.pub_bbox_center = self.create_publisher(PointStamped, self.bbox_center_topic, 10)
         self.pub_bbox_size = self.create_publisher(Float32MultiArray, self.bbox_size_topic, 10)
@@ -68,27 +71,27 @@ class YoloGpuTrackerNode(Node):
         self.imgsz = 640
         self.frame_count = 0
 
-        # ===== Z filtering buffer =====
         self.z_history = deque(maxlen=7)
         self.min_history_size = 3
         self.outlier_thresh_m = 0.10
 
-        # ===== debug image timing =====
         self.last_debug_pub_time = None
 
         self.get_logger().info("========================================")
         self.get_logger().info("YOLO RIGHT ARM NODE STARTED")
-        self.get_logger().info(f"color_topic             : {self.color_topic}")
-        self.get_logger().info(f"depth_topic             : {self.depth_topic}")
-        self.get_logger().info(f"info_topic              : {self.info_topic}")
-        self.get_logger().info(f"target_3d_topic         : {self.target_3d_topic}")
-        self.get_logger().info(f"bbox_center_topic       : {self.bbox_center_topic}")
-        self.get_logger().info(f"bbox_size_topic         : {self.bbox_size_topic}")
-        self.get_logger().info(f"bbox_size_m_topic       : {self.bbox_size_m_topic}")
-        self.get_logger().info(f"debug_image_topic       : {self.debug_image_topic}")
-        self.get_logger().info(f"debug_image_enable      : {self.debug_image_enable}")
-        self.get_logger().info(f"debug_publish_period_sec: {self.debug_publish_period_sec}")
-        self.get_logger().info(f"debug_jpeg_quality      : {self.debug_jpeg_quality}")
+        self.get_logger().info(f"color_topic                : {self.color_topic}")
+        self.get_logger().info(f"depth_topic                : {self.depth_topic}")
+        self.get_logger().info(f"info_topic                 : {self.info_topic}")
+        self.get_logger().info(f"target_3d_topic            : {self.target_3d_topic}")
+        self.get_logger().info(f"bbox_center_topic          : {self.bbox_center_topic}")
+        self.get_logger().info(f"bbox_size_topic            : {self.bbox_size_topic}")
+        self.get_logger().info(f"bbox_size_m_topic          : {self.bbox_size_m_topic}")
+        self.get_logger().info(f"debug_image_topic          : {self.debug_image_topic}")
+        self.get_logger().info(f"debug_image_enable         : {self.debug_image_enable}")
+        self.get_logger().info(f"debug_publish_period_sec   : {self.debug_publish_period_sec}")
+        self.get_logger().info(f"debug_jpeg_quality         : {self.debug_jpeg_quality}")
+        self.get_logger().info(f"skip_if_time_diff_too_large: {self.skip_if_time_diff_too_large}")
+        self.get_logger().info(f"max_color_depth_dt_ms      : {self.max_color_depth_dt_ms}")
         self.get_logger().info("========================================")
 
     def info_cb(self, msg: CameraInfo):
@@ -115,7 +118,14 @@ class YoloGpuTrackerNode(Node):
                 self.get_logger().warn("⚠️ Waiting for Depth Image...")
             return
 
-        self._log_time_diff_if_needed(msg, self.latest_depth_msg)
+        dt_ms = self._time_diff_ms(msg.header, self.latest_depth_msg.header)
+        self._log_time_diff_if_needed(msg.header, self.latest_depth_msg.header)
+
+        if self.skip_if_time_diff_too_large and dt_ms is not None and dt_ms > self.max_color_depth_dt_ms:
+            self.get_logger().warn(
+                f"⏭️ Skip publish: color-depth dt too large ({dt_ms:.2f} ms > {self.max_color_depth_dt_ms:.2f} ms)"
+            )
+            return
 
         try:
             np_arr = np.frombuffer(msg.data, np.uint8)
@@ -133,6 +143,7 @@ class YoloGpuTrackerNode(Node):
             source=frame_rgb,
             imgsz=self.imgsz,
             conf=0.25,
+            # classes=[39],
             verbose=False,
             device=self.device,
             half=True
@@ -198,20 +209,19 @@ class YoloGpuTrackerNode(Node):
                     except Exception:
                         class_name = str(cls_id)
 
-                # 1) bbox center pixel publish
+
                 bbox_center_msg = PointStamped()
-                bbox_center_msg.header = self.latest_depth_msg.header
+                bbox_center_msg.header.stamp = msg.header.stamp
+                bbox_center_msg.header.frame_id = self.latest_depth_msg.header.frame_id
                 bbox_center_msg.point.x = float(u)
                 bbox_center_msg.point.y = float(v)
                 bbox_center_msg.point.z = 0.0
                 self.pub_bbox_center.publish(bbox_center_msg)
 
-                # 2) bbox size(px) publish
                 bbox_size_msg = Float32MultiArray()
                 bbox_size_msg.data = [float(width_px), float(height_px)]
                 self.pub_bbox_size.publish(bbox_size_msg)
 
-                # 3) depth -> 3D
                 depth_m = self._get_median_depth(
                     cv_depth,
                     self.latest_depth_msg.encoding,
@@ -222,8 +232,7 @@ class YoloGpuTrackerNode(Node):
                 if depth_m is None:
                     self.get_logger().warn(
                         f"det_id={cls_id:02d} class={class_name} conf={conf_val:.2f} "
-                        f"center_px=({u},{v}) bbox_px=({width_px:.1f},{height_px:.1f}) "
-                        f"depth=INVALID"
+                        f"center_px=({u},{v}) bbox_px=({width_px:.1f},{height_px:.1f}) depth=INVALID"
                     )
                     if draw_overlay:
                         self._draw_detection(
@@ -257,18 +266,17 @@ class YoloGpuTrackerNode(Node):
                     )
                     continue
 
-                # 4) 중심 3D 좌표 계산
                 x_m = (u - cx) * z_filtered / fx
                 y_m = (v - cy) * z_filtered / fy
 
                 out_pt = PointStamped()
-                out_pt.header = self.latest_depth_msg.header
+                out_pt.header.stamp = msg.header.stamp
+                out_pt.header.frame_id = self.latest_depth_msg.header.frame_id
                 out_pt.point.x = float(x_m)
                 out_pt.point.y = float(y_m)
                 out_pt.point.z = float(z_filtered)
                 self.pub_3d.publish(out_pt)
 
-                # 5) bbox 실제 크기 근사값(m) 계산
                 real_width_m = float(width_px * z_filtered / fx)
                 real_height_m = float(height_px * z_filtered / fy)
 
@@ -282,7 +290,8 @@ class YoloGpuTrackerNode(Node):
                         f"center_px=({u},{v}) "
                         f"xyz=({x_m:.3f},{y_m:.3f},{z_filtered:.3f})m "
                         f"bbox_px=({width_px:.1f},{height_px:.1f}) "
-                        f"bbox_m≈({real_width_m:.3f},{real_height_m:.3f})"
+                        f"bbox_m≈({real_width_m:.3f},{real_height_m:.3f}) | "
+                        f"stamp=color, frame={out_pt.header.frame_id}, dt={dt_ms:.2f}ms"
                     )
 
                 if draw_overlay:
@@ -302,10 +311,7 @@ class YoloGpuTrackerNode(Node):
                         cls_id=-1, class_name="unknown", conf_val=-1.0, extra_text=""):
         x1i, y1i, x2i, y2i = int(x1), int(y1), int(x2), int(y2)
 
-        # bbox
         cv2.rectangle(img, (x1i, y1i), (x2i, y2i), (0, 255, 0), 2)
-
-        # center
         cv2.circle(img, (u, v), 4, (0, 0, 255), -1)
 
         label = f"ID:{cls_id} {class_name}"
@@ -370,13 +376,12 @@ class YoloGpuTrackerNode(Node):
                 valid = patch[patch > 0]
                 return float(np.median(valid)) / 1000.0 if valid.size > 0 else None
 
-            elif "32FC1" in encoding:
+            if "32FC1" in encoding:
                 valid = patch[np.isfinite(patch) & (patch > 0)]
                 return float(np.median(valid)) if valid.size > 0 else None
 
-            else:
-                self.get_logger().error(f"Unsupported depth encoding: {encoding}")
-                return None
+            self.get_logger().error(f"Unsupported depth encoding: {encoding}")
+            return None
 
         except Exception as e:
             self.get_logger().error(f"Depth error: {e}")
@@ -400,13 +405,18 @@ class YoloGpuTrackerNode(Node):
             self.get_logger().error(f"Filtered depth error: {e}")
             return None
 
-    def _log_time_diff_if_needed(self, color_msg, depth_msg):
+    def _time_diff_ms(self, color_header, depth_header):
         try:
-            color_t = color_msg.header.stamp.sec + color_msg.header.stamp.nanosec * 1e-9
-            depth_t = depth_msg.header.stamp.sec + depth_msg.header.stamp.nanosec * 1e-9
-            diff_ms = abs(color_t - depth_t) * 1000.0
+            color_t = color_header.stamp.sec + color_header.stamp.nanosec * 1e-9
+            depth_t = depth_header.stamp.sec + depth_header.stamp.nanosec * 1e-9
+            return abs(color_t - depth_t) * 1000.0
+        except Exception:
+            return None
 
-            if diff_ms > 100.0:
+    def _log_time_diff_if_needed(self, color_header, depth_header):
+        try:
+            diff_ms = self._time_diff_ms(color_header, depth_header)
+            if diff_ms is not None and diff_ms > self.warn_if_time_diff_ms:
                 self.get_logger().warn(
                     f"⚠️ Color/Depth timestamp diff is large: {diff_ms:.2f} ms"
                 )
